@@ -1,4 +1,9 @@
 #include "systemcalls.h"
+#include <unistd.h>
+#include <stdlib.h>
+#include <sys/wait.h>
+#include <fcntl.h>
+#include <errno.h>
 
 /**
  * @param cmd the command to execute with system()
@@ -9,15 +14,9 @@
 */
 bool do_system(const char *cmd)
 {
+    int ret = system(cmd);
 
-/*
- * TODO  add your code here
- *  Call the system() function with the command set in the cmd
- *   and return a boolean true if the system() call completed with success
- *   or false() if it returned a failure
-*/
-
-    return true;
+    return (ret == 0);
 }
 
 /**
@@ -40,6 +39,7 @@ bool do_exec(int count, ...)
     va_start(args, count);
     char * command[count+1];
     int i;
+    bool success = true;
     for(i=0; i<count; i++)
     {
         command[i] = va_arg(args, char *);
@@ -49,19 +49,35 @@ bool do_exec(int count, ...)
     // and may be removed
     command[count] = command[count];
 
-/*
- * TODO:
- *   Execute a system command by calling fork, execv(),
- *   and wait instead of system (see LSP page 161).
- *   Use the command[0] as the full path to the command to execute
- *   (first argument to execv), and use the remaining arguments
- *   as second argument to the execv() command.
- *
-*/
+    pid_t pid = fork();
+
+    if(pid == 0)
+    {
+        execv(command[0], &command[0]);
+        perror("execv");
+        exit(errno);
+    }
+    else if(pid < 0)
+    {
+        success = false;
+    }
+    else
+    {
+        int wStatus = 0;
+        int waitRet = wait(&wStatus);
+        if((waitRet == pid) && (WIFEXITED(wStatus)) && (WEXITSTATUS(wStatus) == 0))
+        {
+            success = true;
+        }
+        else
+        {
+            success = false;
+        }
+    }
 
     va_end(args);
 
-    return true;
+    return success;
 }
 
 /**
@@ -75,6 +91,7 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
     va_start(args, count);
     char * command[count+1];
     int i;
+    bool success = true;
     for(i=0; i<count; i++)
     {
         command[i] = va_arg(args, char *);
@@ -83,6 +100,53 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
     // this line is to avoid a compile warning before your implementation is complete
     // and may be removed
     command[count] = command[count];
+
+    int fd = open(outputfile, O_WRONLY|O_TRUNC|O_CREAT, 0644);
+
+    if(fd < 0)
+    {
+        success = false;
+    }
+
+    if(success)
+    {
+        pid_t pid = fork();
+
+        if(pid == 0)
+        {
+            // Child task executes from here
+            int newFd = dup2(fd, STDOUT_FILENO);
+            close(fd);
+            if(newFd != STDOUT_FILENO)
+            {
+                success = false;
+            }
+            else
+            {
+                int execRet = execv(command[0], &command[0]);
+                if(execRet != 0)
+                {
+                    success = false;
+                }
+            }
+        }
+        else
+        {
+            // Parent process continues here to wait for child
+            close(fd);
+            int wStatus = 0;
+            int waitRet = wait(&wStatus);
+            if((waitRet == pid) && (WIFEXITED(wStatus)) && (WEXITSTATUS(wStatus) == 0))
+            {
+                // success
+                success = true;
+            }
+            else
+            {
+                success = false;
+            }
+        }
+    }
 
 
 /*
