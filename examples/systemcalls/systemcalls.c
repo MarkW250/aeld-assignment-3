@@ -16,7 +16,7 @@ bool do_system(const char *cmd)
 {
     int ret = system(cmd);
 
-    return (ret == 0);
+    return ((WIFEXITED(ret)) && (WEXITSTATUS(ret) == 0));
 }
 
 /**
@@ -107,8 +107,7 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
     {
         success = false;
     }
-
-    if(success)
+    else
     {
         pid_t pid = fork();
 
@@ -123,11 +122,9 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
             }
             else
             {
-                int execRet = execv(command[0], &command[0]);
-                if(execRet != 0)
-                {
-                    success = false;
-                }
+                execv(command[0], &command[0]);
+                perror("execv");
+                exit(errno);
             }
         }
         else
@@ -148,16 +145,7 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
         }
     }
 
-
-/*
- * TODO
- *   Call execv, but first using https://stackoverflow.com/a/13784315/1446624 as a refernce,
- *   redirect standard out to a file specified by outputfile.
- *   The rest of the behaviour is same as do_exec()
- *
-*/
-
     va_end(args);
 
-    return true;
+    return success;
 }
