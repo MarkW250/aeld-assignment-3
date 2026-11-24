@@ -1,0 +1,22 @@
+#!/bin/sh
+
+case "$1" in
+    start)
+        echo "Starting aesdsocket server"
+        if [ "$2" = "-l" ]; then
+            SCRIPT_DIR=$(dirname $(realpath $0))
+            start-stop-daemon -S -n aesdsocket -a $SCRIPT_DIR/aesdsocket -- -d
+        else
+            start-stop-daemon -S -n aesdsocket -a /usr/bin/aesdsocket -- -d
+        fi
+        ;;
+    stop)
+        echo "Stopping aesdsocket server"
+        start-stop-daemon -K -n aesdsocket
+        ;;
+    *)
+        echo "Usage: $0 {start|stop}"
+    exit 1
+esac
+
+exit 0
