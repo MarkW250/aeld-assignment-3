@@ -12,7 +12,14 @@
 #include <unistd.h>
 #include <signal.h>
 #include <fcntl.h>
+#include <pthread.h>
 
+
+const char* DATA_CACHE_FILIE = "/var/tmp/aesdsocketdata";
+static volatile sig_atomic_t kill_requested = false;
+
+
+/*** PACKET HANDLING ***/
 struct PartialPacket
 {
     int length;
@@ -180,15 +187,7 @@ int FullPacket_AppendToFile(struct FullPacket* packet, const char* path)
     return 0;
 }
 
-
-void *get_in_addr(struct sockaddr *sa)
-{
-    if (sa->sa_family == AF_INET) {
-        return &(((struct sockaddr_in*)sa)->sin_addr);
-    }
-
-    return &(((struct sockaddr_in6*)sa)->sin6_addr);
-}
+/*** CONNECTION HANDLING ***/
 
 int send_data_from_file(const char* path, int socketFd)
 {
@@ -198,11 +197,12 @@ int send_data_from_file(const char* path, int socketFd)
         return errno;
     }
 
-    char buffer[1024];
+    char buffer[10000];
     bool eof = false;
 
     while(eof == false)
     {
+        memset(buffer, 0, sizeof(buffer));
         size_t bytesRead = fread(buffer, 1, sizeof(buffer), file);
         if(ferror(file))
         {
@@ -220,6 +220,7 @@ int send_data_from_file(const char* path, int socketFd)
             int totalBytesSent = 0;
             while(totalBytesSent < bytesRead)
             {
+                printf("Sending: %s\n", buffer);
                 int bytesSent = send(socketFd, &buffer[totalBytesSent], bytesRead, 0);
                 if(bytesSent < 0)
                 {
@@ -235,43 +236,283 @@ int send_data_from_file(const char* path, int socketFd)
     return 0;
 }
 
-static volatile sig_atomic_t kill_requested = false;
+struct Connection
+{
+    pthread_t threadId;
+    sig_atomic_t connectedFd;
+    sig_atomic_t active;
+    pthread_mutex_t* fileMutex;
+    int threadReturn;
+    struct Connection* previous;
+};
+
+static void* Connection_ThreadEntry(void* arg)
+{
+    struct Connection* connectionInfo = arg;
+    struct FullPacket* packet = NULL;
+    int ret = 0;
+    int res = 0;
+    
+    
+    if(connectionInfo == NULL)
+    {
+        pthread_exit(NULL);
+    }
+    
+    pthread_mutex_t* fileMutex = connectionInfo->fileMutex;
+    int connectedFd = connectionInfo->connectedFd;
+    connectionInfo->threadReturn = 0;
+    
+    printf("Connection thread for connection %d started\n", connectedFd);
+
+    packet = FullPacket_New();
+    if(packet == NULL)
+    {
+        connectionInfo->threadReturn = 1;
+        pthread_exit(&connectionInfo->threadReturn);
+    }
+
+    bool connected = true;
+    while(connected && connectionInfo->active)
+    {
+        char buffer[1024] = {0};
+
+        int bytesReceived = recv(connectedFd, buffer, sizeof(buffer), 0);
+        if(bytesReceived == 0)
+        {
+            printf("Connection closed...\n");
+            connected = false;
+        }
+        else if(bytesReceived < 0)
+        {
+            printf("Error receiving data...\n");
+            connected = false;
+        }
+        else
+        {
+            res = pthread_mutex_lock(fileMutex);
+            if(res != 0)
+            {
+                ret = 1;
+                printf("Error locking mutex\n");
+                goto cleanup_exit;
+            }
+            printf("%d bytes received: %.*s\n", bytesReceived, bytesReceived, buffer);
+            int offset = 0;
+            while(bytesReceived > 0)
+            {
+                int dataAdded = FullPacket_AddData(packet, &buffer[offset], bytesReceived);
+                if(dataAdded < 0)
+                {
+                    printf("Error adding data to packet (most likely out of memory)\n");
+                    ret = 1;
+                    goto cleanup_exit;
+                }
+
+                if(packet->complete == true)
+                {
+                    // Dump to file and start with a new packet
+                    res = FullPacket_AppendToFile(packet, DATA_CACHE_FILIE);
+                    if(res != 0)
+                    {
+                        ret = 1;
+                        printf("Error appending to file\n");
+                        goto cleanup_exit;
+                    }
+
+                    FullPacket_Free(packet);
+                    packet = FullPacket_New();
+                    if(packet == NULL)
+                    {
+                        ret = 1;
+                        printf("Unable to create new packet (probably out of memory)\n");
+                        goto cleanup_exit;
+                    }
+
+                    // Send data back
+                    res = send_data_from_file(DATA_CACHE_FILIE, connectedFd);
+                    if(res != 0)
+                    {
+                        ret = 1;
+                        printf("Unable to send data\n");
+                        goto cleanup_exit;
+                    }
+                }
+
+                bytesReceived -= dataAdded;
+                offset += dataAdded;
+            }
+            pthread_mutex_unlock(fileMutex);
+        }
+        if(kill_requested)
+        {
+            connected = false;
+        }
+    }
+
+    cleanup_exit:
+    connectionInfo->active = false;
+    FullPacket_Free(packet);
+    connectionInfo->threadReturn = ret;
+    pthread_mutex_unlock(fileMutex);
+    pthread_exit(&connectionInfo->threadReturn);
+}
+
+struct Connection* Connection_Add(struct Connection* head, int fd, pthread_mutex_t* fileMutex)
+{
+    struct Connection* newConnection = malloc(sizeof(struct Connection));
+    if(newConnection == NULL)
+    {
+        return NULL;
+    }
+
+    newConnection->active = true;
+    newConnection->fileMutex = fileMutex;
+    newConnection->connectedFd = fd;
+    newConnection->previous = head;
+    newConnection->threadReturn = 0;
+
+    int ret = pthread_create(&newConnection->threadId, NULL, Connection_ThreadEntry, newConnection);
+    if(ret != 0)
+    {
+        free(newConnection);
+        return NULL;
+    }
+
+    return newConnection;
+}
+
+struct Connection* Connection_RemoveInactive(struct Connection* head)
+{
+    struct Connection* current = head;
+    struct Connection* newHead = head;
+    struct Connection* next = NULL;
+    while(current != NULL)
+    {
+        struct Connection* previous = current->previous;
+        if(current->connectedFd == false || current->active == false)
+        {
+            if(newHead == current)
+            {
+                newHead = previous;
+            }
+            if(next != NULL)
+            {
+                next->previous = previous;
+            }
+            pthread_join(current->threadId, NULL);
+            free(current);
+        }
+        else
+        {
+            next = current;
+        }
+        current = previous;
+    }
+
+    return newHead;
+}
+
+void Connection_Cleanup(struct Connection* head)
+{
+    struct Connection* current = head;
+    while(current != NULL)
+    {
+        struct Connection* next = current->previous;
+        if(current->active == true)
+        {
+            current->active = false;
+            pthread_join(current->threadId, NULL);
+        }
+        free(current);
+        current = next;
+    }
+}
+
+/*** GENERIC CODE ****/
+void *get_in_addr(struct sockaddr *sa)
+{
+    if (sa->sa_family == AF_INET) {
+        return &(((struct sockaddr_in*)sa)->sin_addr);
+    }
+
+    return &(((struct sockaddr_in6*)sa)->sin6_addr);
+}
+
+
 static void signal_handler(int signal)
 {
     (void)signal; // unused
     kill_requested = true;
 }
 
-const char* DATA_CACHE_FILIE = "/var/tmp/aesdsocketdata";
+static void timer_event_handler(union sigval eventInfo)
+{
+    pthread_mutex_t* fileMutex = eventInfo.sival_ptr;
+    char timeStamp[128];
+
+    memset(timeStamp, 0, sizeof(timeStamp));
+
+    struct timespec ts;
+    struct tm tm_info;
+    if (clock_gettime(CLOCK_REALTIME, &ts) == -1) {
+        perror("clock_gettime");
+        return;
+    }
+
+    if (localtime_r(&ts.tv_sec, &tm_info) == NULL) {
+        perror("localtime_r");
+        return;
+    }
+
+    size_t stringSize = strftime(timeStamp, sizeof(timeStamp), "timestamp: %a, %d %b %Y %H:%M:%S %z\n", &tm_info);
+    if (stringSize == 0) {
+        fprintf(stderr, "strftime failed\n");
+        return;
+    }
+
+    printf("Writing timestamp to file: %s\n", timeStamp);
+
+    if(pthread_mutex_lock(fileMutex) != 0)
+    {
+        fprintf(stderr, "Error locking mutex\n");
+        return;
+    }
+
+    FILE* file = fopen(DATA_CACHE_FILIE, "a");
+    if(file == NULL)
+    {
+        const char* errorDescription = strerror(errno);
+        if(errorDescription != NULL)
+        {
+            printf("Unable to open file: %s\n", errorDescription);
+        }
+        pthread_mutex_unlock(fileMutex);
+        return;
+    }
+
+    int written = fwrite(timeStamp, 1, stringSize, file);
+    if(written != stringSize)
+    {
+        printf("Unexpected amount of bytes written. Should be %ld, but only %d were written.\n", stringSize, written);
+    }
+    pthread_mutex_unlock(fileMutex);
+    fclose(file);
+
+}
+
 int main(int argc, char** argv)
 {
     bool runDaemon = false;
-    struct FullPacket* packet = NULL;
     int programResult = 0;
     struct addrinfo hints;
     struct addrinfo* infoResult = NULL;
+    struct Connection* connectionHead = NULL;
     int res = 0;
     int connectedFd = -1;
+    pthread_mutex_t fileMutex;
 
-    struct sigaction action;
-    memset(&action, 0, sizeof(action));
-    action.sa_flags = 0;
-    action.sa_restorer = NULL;
-    action.sa_handler = signal_handler;
-    res = sigaction(SIGTERM, &action, NULL);
-    if(res != 0)
-    {
-        printf("Error: Unable to set signal handler: %d\n", errno);
-        return 1;
-    }
-    res = sigaction(SIGINT, &action, NULL);
-    if(res != 0)
-    {
-        printf("Error: Unable to set signal handler: %d\n", errno);
-        return 1;
-    }
-
-    syslog(LOG_INFO, "Launching\n");
+        syslog(LOG_INFO, "Launching\n");
     printf("Data cache file path: %s\n", DATA_CACHE_FILIE);
 
     if(argc > 2)
@@ -296,6 +537,102 @@ int main(int argc, char** argv)
         {
             runDaemon = true;
         }
+    }
+
+    if(runDaemon)
+    {
+        int pid = fork();
+        if(pid < 0)
+        {
+            printf("Error creating deamon: %d\n", errno);
+            programResult = 8;
+            goto cleanup_exit;
+        }
+        else if(pid > 0)
+        {
+            printf("Deamon running with PID %d\n", pid);
+            // exit(0);
+            programResult = 0;
+            goto cleanup_exit;
+        }
+
+        // PID == 0 from here on; running as child process
+        chdir("/");
+        fflush(stdout); // Flush any buffered output before redirecting
+
+        // Open /dev/null for writing
+        int dev_null = open("/dev/null", O_WRONLY);
+        if (dev_null == -1) {
+            perror("open");
+            programResult = 8;
+            goto cleanup_exit;
+        }
+
+        // Replace stdout (fd 1) with /dev/null
+        if (dup2(dev_null, STDOUT_FILENO) == -1) {
+            perror("dup2");
+            close(dev_null);
+            programResult = 8;
+            goto cleanup_exit;
+        }
+
+        // Replace stderr (fd 2) with /dev/null
+        if (dup2(dev_null, STDERR_FILENO) == -1) {
+            perror("dup2");
+            close(dev_null);
+            programResult = 8;
+            goto cleanup_exit;
+        }
+
+        // Close the extra file descriptor
+        close(dev_null);
+    }
+
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    action.sa_flags = 0;
+    action.sa_restorer = NULL;
+    action.sa_handler = signal_handler;
+    res = sigaction(SIGTERM, &action, NULL);
+    if(res != 0)
+    {
+        printf("Error: Unable to set signal handler: %d\n", errno);
+        return 1;
+    }
+    res = sigaction(SIGINT, &action, NULL);
+    if(res != 0)
+    {
+        printf("Error: Unable to set signal handler: %d\n", errno);
+        return 1;
+    }
+
+    res = pthread_mutex_init(&fileMutex, NULL);
+    if(res < 0)
+    {
+        return 1;
+    }
+
+    // Start and setup timer
+    struct sigevent event;
+    event.sigev_notify = SIGEV_THREAD;
+    event.sigev_notify_function = timer_event_handler;
+    event.sigev_notify_attributes = NULL;
+    event.sigev_value.sival_ptr = &fileMutex;
+    timer_t timerId;
+    res = timer_create(CLOCK_MONOTONIC, &event, &timerId);
+    if(res < 0)
+    {
+        return 1;
+    }
+    struct itimerspec timerSpec;
+    timerSpec.it_interval.tv_nsec = 0;
+    timerSpec.it_interval.tv_sec = 10;
+    timerSpec.it_value.tv_nsec = 0;
+    timerSpec.it_value.tv_sec = 10;
+    res = timer_settime(timerId, 0, &timerSpec, NULL);
+    if(res < 0)
+    {
+        return 1;
     }
 
     res = remove(DATA_CACHE_FILIE);
@@ -332,7 +669,15 @@ int main(int argc, char** argv)
         programResult = 2;
         goto cleanup_exit;
     }
-    
+
+    res = fcntl(socketFd, F_SETFL, fcntl(socketFd, F_GETFL) | O_NONBLOCK);
+    if(res < 0)
+    {
+        printf("Error setting socket as non blocking: %d\n", errno);
+        programResult = 2;
+        goto cleanup_exit;
+    }
+
     int yes=1;
     res = setsockopt(socketFd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
     if(res != 0)
@@ -350,59 +695,8 @@ int main(int argc, char** argv)
         goto cleanup_exit;
     }
 
-    if(runDaemon)
-    {
-        int pid = fork();
-        if(pid < 0)
-        {
-            printf("Error creating deamon: %d\n", errno);
-            programResult = 8;
-            goto cleanup_exit;
-        }
-        else if(pid > 0)
-        {
-            printf("Deamon running with PID %d\n", pid);
-            exit(0);
-            programResult = 0;
-            goto cleanup_exit;
-        }
-
-        // PID == 0 from here on; running as child process
-        chdir("/");
-        fflush(stdout); // Flush any buffered output before redirecting
-
-        // Open /dev/null for writing
-        int dev_null = open("/dev/null", O_WRONLY);
-        if (dev_null == -1) {
-            perror("open");
-            return 1;
-        }
-
-        // Replace stdout (fd 1) with /dev/null
-        if (dup2(dev_null, STDOUT_FILENO) == -1) {
-            perror("dup2");
-            close(dev_null);
-            return 1;
-        }
-
-        // Replace stderr (fd 2) with /dev/null
-        if (dup2(dev_null, STDERR_FILENO) == -1) {
-            perror("dup2");
-            close(dev_null);
-            return 1;
-        }
-
-        // Close the extra file descriptor
-        close(dev_null);
-    }
-    
     bool running = kill_requested ? false : true;
-    packet = FullPacket_New();
-    if(packet == NULL)
-    {
-        programResult = 4;
-        goto cleanup_exit;
-    }
+
     while(running)
     {
         printf("Listening for new connections...\n");
@@ -416,17 +710,33 @@ int main(int argc, char** argv)
         
         struct sockaddr_storage connectedAddr;
         socklen_t addrSize = sizeof(connectedAddr);
-        connectedFd = accept(socketFd, (struct sockaddr *)&connectedAddr, &addrSize);
-        if(connectedFd < 0)
+        bool acceptedConnection = false;
+        while((acceptedConnection == false) && (running == true))
         {
-            if(kill_requested)
+            connectedFd = accept(socketFd, (struct sockaddr *)&connectedAddr, &addrSize);
+            if(connectedFd < 0)
             {
-                running = false;
+                if(errno == EAGAIN)
+                {
+                    connectionHead = Connection_RemoveInactive(connectionHead);
+                }
+                else
+                {
+                    printf("Error accepting connection: %d\n", errno);
+                }
+                if(kill_requested)
+                {
+                    running = false;
+                }
             }
             else
             {
-                printf("Error accepting connection: %d\n", errno);
+                acceptedConnection = true;
             }
+        }
+
+        if(kill_requested)
+        {
             continue;
         }
 
@@ -434,87 +744,26 @@ int main(int argc, char** argv)
         inet_ntop(connectedAddr.ss_family,
             get_in_addr((struct sockaddr *)&connectedAddr),
             addrString, sizeof(addrString));
-        printf("Connection established from: %s \n", addrString);
+        printf("Connection established from: %s on connection file %d \n", addrString, connectedFd);
         syslog(LOG_INFO, "Accepted connection from %s\n", addrString);
 
-        bool connected = true;
-        while(connected)
+        connectionHead = Connection_Add(connectionHead, connectedFd, &fileMutex);
+        if(connectionHead == NULL)
         {
-            char buffer[1024] = {0};
-            int bytesReceived = recv(connectedFd, buffer, sizeof(buffer), 0);
-            if(bytesReceived == 0)
-            {
-                printf("Connection closed...\n");
-                connected = false;
-            }
-            else if(bytesReceived < 0)
-            {
-                printf("Error receiving data...\n");
-                connected = false;
-            }
-            else
-            {
-                printf("%d bytes received: %.*s\n", bytesReceived, bytesReceived, buffer);
-                int offset = 0;
-                while(bytesReceived > 0)
-                {
-                    int dataAdded = FullPacket_AddData(packet, &buffer[offset], bytesReceived);
-                    if(dataAdded < 0)
-                    {
-                        printf("Error adding data to packet\n");
-                        programResult = 5;
-                        goto cleanup_exit;
-                    }
-
-                    if(packet->complete == true)
-                    {
-                        // Dump to file and start with a new packet
-                        res = FullPacket_AppendToFile(packet, DATA_CACHE_FILIE);
-                        if(res != 0)
-                        {
-                            programResult = 6;
-                            goto cleanup_exit;
-                        }
-
-                        FullPacket_Free(packet);
-                        packet = FullPacket_New();
-                        if(packet == NULL)
-                        {
-                            programResult = 4;
-                            goto cleanup_exit;
-                        }
-
-                        // Send data back
-                        res = send_data_from_file(DATA_CACHE_FILIE, connectedFd);
-                        if(res != 0)
-                        {
-                            programResult = 7;
-                            goto cleanup_exit;
-                        }
-
-                    }
-
-                    bytesReceived -= dataAdded;
-                    offset += dataAdded;
-                }
-            }
-            if(kill_requested)
-            {
-                connected = false;
-            }
+            printf("Unable to start connection thread\n");
+            programResult = 5;
+            goto cleanup_exit;
         }
-        if(kill_requested)
-        {
-            running = false;
-        }
+
+        connectionHead = Connection_RemoveInactive(connectionHead);
     }
 
     cleanup_exit:
     printf("Ending server\n");
     freeaddrinfo(infoResult);
-    FullPacket_Free(packet);
     close(connectedFd);
-
+    pthread_mutex_destroy(&fileMutex);
+    Connection_Cleanup(connectionHead);
 
     return programResult;
 }

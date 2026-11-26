@@ -1,13 +1,14 @@
 
-APP="aesdsocket"
-CC=$(CROSS_COMPILE)gcc
+APP = "aesdsocket"
+CC ?= $(CROSS_COMPILE)gcc
 
-CFLAGS += -Wall -Werror -g
+CFLAGS ?= -Wall -Werror -g
+LDFLAGS ?=
 
 all: $(APP)
 
 $(APP): aesdsocket.c
-	$(CC) $(CFLAGS) -o $@ $<
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
 clean:
 	rm -f $(APP)
